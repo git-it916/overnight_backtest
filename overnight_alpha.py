@@ -20,6 +20,7 @@ ITEM_CODE_MAP = {
 }
 
 REQUIRED_COLS = ("open", "high", "low", "close")
+ITEM_CODE_PATTERN = re.compile(r"^I\d{7,}[A-Za-z0-9]*$")
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,24 @@ def _find_label_row(
     return None
 
 
+def _is_item_code(value) -> bool:
+    normalized = _normalize_code(value)
+    return bool(normalized and ITEM_CODE_PATTERN.match(normalized))
+
+
+def _find_item_row(df_raw: pd.DataFrame) -> int | None:
+    candidates = []
+    for idx in range(len(df_raw)):
+        row = df_raw.iloc[idx]
+        if any(_normalize_code(cell) == "Item" for cell in row):
+            code_count = sum(1 for cell in row if _is_item_code(cell))
+            candidates.append((code_count, idx))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: (-pair[0], pair[1]))
+    return candidates[0][1]
+
+
 def _map_item_codes(df: pd.DataFrame) -> pd.DataFrame:
     normalized_map = {_normalize_code(code): name for code, name in ITEM_CODE_MAP.items()}
     rename_map = {}
@@ -85,7 +104,7 @@ def load_dataguide_excel(path: str | Path, sheet_name: int | str = 0) -> pd.Data
         raise SystemExit(f"Input file not found: {path}")
 
     raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
-    item_row = _find_label_row(raw, "Item")
+    item_row = _find_item_row(raw)
     if item_row is None:
         raise SystemExit("Could not locate the 'Item' row in the DataGuide file.")
 
