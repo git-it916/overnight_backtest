@@ -1,87 +1,41 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 import re
-
 import numpy as np
 import pandas as pd
 
-
+# ==============================================================================
+# 1. 데이터 매핑 (사모펀드 포함)
+# ==============================================================================
 ITEM_CODE_MAP = {
     "I31000010F": "open",
     "I31000020F": "high",
     "I31000030F": "low",
     "I31000040F": "close",
-    "I31000050F": "volume",
-    "I310000600": "turnover",
-    "I310021132": "foreign_net",
-    "I310021232": "inst_net",
+    "I310000600": "turnover",      # 거래대금
+    "I310020932": "net_priv_fund", # 사모펀드 순매수 (핵심)
+    "I310023132": "net_foreign",   # 외국인계 (참고)
 }
 
-REQUIRED_COLS = ("open", "high", "low", "close")
-ITEM_CODE_PATTERN = re.compile(r"^I\d{7,}[A-Za-z0-9]*$")
-
-
+# ==============================================================================
+# 2. 파라미터 클래스 (핵심 변수 4개만 남김 - 오류 원인 제거)
+# ==============================================================================
 @dataclass(frozen=True)
 class Params:
-    gap_abs_max: float
-    take_profit_opening: float
-    stop_opening: float
-    dir_ratio_thresh: float
-    cost: float
-    optimistic_fill: bool
-    path_dependency_mode: str | None = None
-    require_flow_data: bool = False
+    rolling_window: int = 60       # 랭크 산정 기간 (60일)
+    buy_threshold: float = 0.10    # 매수 기준 (하위 10%)
+    sell_threshold: float = 0.90   # 매도 기준 (상위 10%)
+    cost: float = 0.0015           # 거래비용 (0.15%)
 
-
+# ==============================================================================
+# 3. 유틸리티 함수들
+# ==============================================================================
 def _normalize_code(value) -> str | None:
-    if pd.isna(value):
-        return None
+    if pd.isna(value): return None
     text = str(value)
-    text = text.replace("\u00A0", "")
-    text = text.strip()
-    if not text:
-        return None
-    if text.endswith(".0") and text.replace(".", "").isdigit():
-        text = text[:-2]
-    text = re.sub(r"\s+", "", text)
     text = re.sub(r"[^A-Za-z0-9]", "", text)
     return text or None
-
-
-def _find_label_row(
-    df_raw: pd.DataFrame, label: str, start_row: int = 0
-) -> int | None:
-    label = _normalize_code(label)
-    if not label:
-        return None
-    for idx in range(start_row, len(df_raw)):
-        row = df_raw.iloc[idx]
-        for cell in row:
-            cell_label = _normalize_code(cell)
-            if cell_label and cell_label.lower() == label.lower():
-                return idx
-    return None
-
-
-def _is_item_code(value) -> bool:
-    normalized = _normalize_code(value)
-    return bool(normalized and ITEM_CODE_PATTERN.match(normalized))
-
-
-def _find_item_row(df_raw: pd.DataFrame) -> int | None:
-    candidates = []
-    for idx in range(len(df_raw)):
-        row = df_raw.iloc[idx]
-        if any(_normalize_code(cell) == "Item" for cell in row):
-            code_count = sum(1 for cell in row if _is_item_code(cell))
-            candidates.append((code_count, idx))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda pair: (-pair[0], pair[1]))
-    return candidates[0][1]
-
 
 def _map_item_codes(df: pd.DataFrame) -> pd.DataFrame:
     normalized_map = {_normalize_code(code): name for code, name in ITEM_CODE_MAP.items()}
@@ -90,190 +44,90 @@ def _map_item_codes(df: pd.DataFrame) -> pd.DataFrame:
         normalized = _normalize_code(col)
         if normalized and normalized in normalized_map:
             rename_map[col] = normalized_map[normalized]
-    if not rename_map:
-        return df
+    
+    if not rename_map: return df
     mapped = df.rename(columns=rename_map)
     for col in rename_map.values():
         mapped[col] = pd.to_numeric(mapped[col], errors="coerce")
     return mapped
 
-
-def load_dataguide_excel(path: str | Path, sheet_name: int | str = 0) -> pd.DataFrame:
-    path = Path(path)
-    if not path.exists():
-        raise SystemExit(f"Input file not found: {path}")
-
-    raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
-    item_row = _find_item_row(raw)
-    if item_row is None:
-        raise SystemExit("Could not locate the 'Item' row in the DataGuide file.")
-
-    freq_row = _find_label_row(raw, "Frequency", start_row=item_row + 1)
-    data_start = freq_row + 1 if freq_row is not None else item_row + 1
-
-    item_values = raw.iloc[item_row].tolist()
-    columns = [_normalize_code(value) for value in item_values]
-    if not columns:
-        raise SystemExit("No columns found in the DataGuide Item row.")
-
-    columns[0] = "date"
-    for idx in range(1, len(columns)):
-        if not columns[idx]:
-            columns[idx] = f"col_{idx}"
-
-    data = raw.iloc[data_start:].copy()
-    data.columns = columns
-    data = data.dropna(how="all")
-
-    if "date" not in data.columns:
-        raise SystemExit("Date column not found after parsing the Item row.")
-
-    data["date"] = pd.to_datetime(data["date"], errors="coerce")
-    data = data.dropna(subset=["date"])
-    data = data.set_index("date").sort_index()
-
-    data = _map_item_codes(data)
-    return data
-
-
-def _validate_required_columns(df: pd.DataFrame) -> None:
-    missing = [col for col in REQUIRED_COLS if col not in df.columns]
-    if missing:
-        missing_text = ", ".join(missing)
-        available = sorted(
-            {
-                _normalize_code(col)
-                for col in df.columns
-                if _normalize_code(col)
-            }
-        )
-        preview = ", ".join(available[:20])
-        suffix = "..." if len(available) > 20 else ""
-        raise SystemExit(
-            "Missing required Item codes for OHLC mapping. "
-            f"Required columns after mapping: {missing_text}. "
-            f"Available item codes (normalized): {preview}{suffix}"
-        )
-
-
-def _resolve_path_dependency_mode(params: Params) -> str:
-    if params.path_dependency_mode:
-        mode = params.path_dependency_mode
-    else:
-        mode = "optimistic" if params.optimistic_fill else "conservative"
-    mode = mode.lower()
-    if mode not in {"optimistic", "conservative", "trend"}:
-        raise SystemExit(f"Unsupported path_dependency_mode: {mode}")
-    return mode
-
-
-def run_opening_proxy_backtest(
-    df: pd.DataFrame, direction: pd.Series, params: Params
-) -> pd.DataFrame:
-    d = df.join(direction.rename("direction"), how="inner").copy()
-    d = d.dropna(subset=["direction", "open", "high", "low", "close"])
-
-    prev_close = d["close"].shift(1)
-    d["pnl_overnight"] = d["direction"] * ((d["open"] / prev_close) - 1.0)
-
-    open_to_high = (d["high"] - d["open"]) / d["open"]
-    open_to_low = (d["low"] - d["open"]) / d["open"]
-    open_to_close = (d["close"] - d["open"]) / d["open"]
-
-    long_tp_hit = open_to_high >= params.take_profit_opening
-    long_sl_hit = open_to_low <= -params.stop_opening
-    short_tp_hit = open_to_low <= -params.take_profit_opening
-    short_sl_hit = open_to_high >= params.stop_opening
-
-    long_close = open_to_close
-    short_close = -open_to_close
-
-    mode = _resolve_path_dependency_mode(params)
-    if mode == "trend":
-        pnl_opening = np.where(
-            d["direction"] == 1,
-            long_close,
-            np.where(d["direction"] == -1, short_close, 0.0),
-        )
-    elif mode == "optimistic":
-        long_choice = np.select(
-            [long_tp_hit, long_sl_hit],
-            [params.take_profit_opening, -params.stop_opening],
-            default=long_close,
-        )
-        short_choice = np.select(
-            [short_tp_hit, short_sl_hit],
-            [params.take_profit_opening, -params.stop_opening],
-            default=short_close,
-        )
-        pnl_opening = np.where(
-            d["direction"] == 1,
-            long_choice,
-            np.where(d["direction"] == -1, short_choice, 0.0),
-        )
-    else:
-        long_choice = np.select(
-            [long_sl_hit, long_tp_hit],
-            [-params.stop_opening, params.take_profit_opening],
-            default=long_close,
-        )
-        short_choice = np.select(
-            [short_sl_hit, short_tp_hit],
-            [-params.stop_opening, params.take_profit_opening],
-            default=short_close,
-        )
-        pnl_opening = np.where(
-            d["direction"] == 1,
-            long_choice,
-            np.where(d["direction"] == -1, short_choice, 0.0),
-        )
-
-    d["pnl_opening"] = pnl_opening
-    pnl_gross = d["pnl_overnight"] + d["pnl_opening"]
-    trade_allowed = d["direction"] != 0
-    d["pnl_net"] = np.where(trade_allowed, pnl_gross - params.cost, 0.0)
-    d["equity"] = (1.0 + d["pnl_net"].fillna(0)).cumprod()
-    return d[["direction", "pnl_overnight", "pnl_opening", "pnl_net", "equity"]]
-
-
-def run_alpha_factor_testing(
-    df: pd.DataFrame, params: Params
-) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame]:
-    df = df.copy()
+def load_dataguide_excel(path: str | Path) -> pd.DataFrame:
+    # 1. 헤더 파싱
+    raw = pd.read_excel(path, header=None)
+    item_row_idx = None
+    for i in range(50):
+        row_str = raw.iloc[i].astype(str).values
+        if any("I3100" in s for s in row_str):
+            item_row_idx = i
+            break
+            
+    if item_row_idx is None: raise SystemExit("Item row not found.")
+    
+    # 2. 데이터 로드
+    raw.columns = raw.iloc[item_row_idx]
+    data_start = item_row_idx + 1
+    for i in range(item_row_idx+1, item_row_idx+50):
+        try:
+            dt = pd.to_datetime(raw.iloc[i, 0])
+            if dt.year > 1900:
+                data_start = i
+                break
+        except: continue
+            
+    df = raw.iloc[data_start:].copy()
+    
+    # 3. 컬럼 정리
+    cols = []
+    for c in df.columns:
+        norm = _normalize_code(c)
+        cols.append(norm if norm else "unknown")
+    df.columns = cols
+    
+    df = df.rename(columns={df.columns[0]: "date"})
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+    
+    # 주말 제거
+    df = df[df.index.dayofweek < 5]
     df = _map_item_codes(df)
-    _validate_required_columns(df)
+    
+    return df
 
-    df_features = pd.DataFrame(index=df.index)
-    prev_close = df["close"].shift(1)
-    df_features["gap"] = (df["open"] - prev_close) / prev_close
-    df_features["ret_1d"] = df["close"].pct_change()
-    df_features["open_to_high"] = (df["high"] - df["open"]) / df["open"]
-    df_features["open_to_low"] = (df["low"] - df["open"]) / df["open"]
-
-    price_range = (df["high"] - df["low"]).replace(0, np.nan)
-    df_features["dir_ratio_long"] = (df["high"] - df["open"]) / price_range
-    df_features["dir_ratio_short"] = (df["open"] - df["low"]) / price_range
-
-    cond = (
-        (df_features["open_to_high"] >= params.take_profit_opening)
-        & (df_features["open_to_low"] >= -params.stop_opening)
-        & (df_features["dir_ratio_long"] >= params.dir_ratio_thresh)
-        & (df_features["gap"].abs() <= params.gap_abs_max)
-    )
-    signal = cond.shift(1).fillna(False)
-    direction = signal.astype(int)
-    if params.require_flow_data:
-        flow_cols = {"foreign_net", "inst_net"}
-        if not flow_cols.issubset(df.columns):
-            direction = pd.Series(0, index=df.index, dtype=int)
-
-    backtest = run_opening_proxy_backtest(df, direction, params)
-
-    heatmaps = {
-        "feature_corr": df_features[
-            ["gap", "open_to_high", "open_to_low", "dir_ratio_long"]
-        ].corr()
-    }
-
-    df_features["direction"] = direction
-    return df_features, heatmaps, backtest
+def run_alpha_factor_testing(df: pd.DataFrame, params: Params) -> tuple:
+    df = df.copy()
+    
+    # 1. 갭 계산 (Target)
+    df["gap"] = (df["open"] - df["close"].shift(1)) / df["close"].shift(1)
+    
+    # 2. 팩터 계산
+    if "turnover" not in df.columns:
+        df["turnover"] = df["close"] * 1000 
+    
+    # 거래대금 5일 평균으로 정규화
+    turnover_ma = df["turnover"].rolling(5).mean()
+    df["priv_fund_ratio"] = df["net_priv_fund"] / turnover_ma
+    
+    # 3. 랭크 산출 (0.0 ~ 1.0)
+    df["factor_rank"] = df["priv_fund_ratio"].rolling(window=params.rolling_window).rank(pct=True)
+    
+    # 4. 시그널 생성
+    # 매도폭탄(하위 10%) -> Long
+    long_signal = df["factor_rank"] < params.buy_threshold
+    # 매수폭탄(상위 10%) -> Short
+    short_signal = df["factor_rank"] > params.sell_threshold
+    
+    # 5. 포지션 (오늘 시그널 -> 내일 아침 갭 수익)
+    # shift(1) 필수: 오늘 장마감 후 판단 -> 내일 시가 갭 매매
+    df["position"] = (long_signal.astype(int) - short_signal.astype(int)).shift(1).fillna(0)
+    
+    # 6. 수익률 계산
+    df["strategy_ret"] = df["position"] * df["gap"]
+    trades = df["position"].abs()
+    df["strategy_net"] = df["strategy_ret"] - (trades * params.cost)
+    
+    # 7. 누적 수익
+    df["equity"] = (1 + df["strategy_net"].fillna(0)).cumprod()
+    
+    backtest = df[["gap", "priv_fund_ratio", "factor_rank", "position", "strategy_ret", "strategy_net", "equity"]]
+    
+    return df, {}, backtest

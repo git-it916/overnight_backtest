@@ -1,9 +1,12 @@
+from pathlib import Path
+
 import pandas as pd
 from scipy import stats
 
 # 1. 데이터 로드 (분석 결과 파일)
 # 파일 경로가 맞는지 확인해주세요.
-file_path = "features_output.csv" 
+DATA_DIR = Path(__file__).resolve().parents[1] / "database"
+file_path = DATA_DIR / "features_output.csv"
 
 try:
     df = pd.read_csv(file_path, index_col=0)
@@ -36,4 +39,7 @@ try:
     print("- P-value < 0.01: 매우 강력한 관계임")
     
 except FileNotFoundError:
-    print("오류: 'features_output.csv' 파일을 찾을 수 없습니다. run_analysis.py를 먼저 실행했는지 확인해주세요.")
+    print(
+        "오류: 'features_output.csv' 파일을 찾을 수 없습니다. "
+        "run_analysis.py를 먼저 실행했는지 확인해주세요."
+    )
