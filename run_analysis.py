@@ -16,8 +16,10 @@ def main() -> None:
         take_profit_opening=0.003,
         stop_opening=0.0015,
         dir_ratio_thresh=0.60,
-        cost=0.0002,
-        optimistic_fill=True,
+        cost=0.002,
+        optimistic_fill=False,
+        path_dependency_mode="conservative",
+        require_flow_data=True,
     )
 
     df_features, heatmaps, backtest = run_alpha_factor_testing(df, params)

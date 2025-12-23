@@ -30,6 +30,8 @@ class Params:
     dir_ratio_thresh: float
     cost: float
     optimistic_fill: bool
+    path_dependency_mode: str | None = None
+    require_flow_data: bool = False
 
 
 def _normalize_code(value) -> str | None:
@@ -135,6 +137,86 @@ def _validate_required_columns(df: pd.DataFrame) -> None:
         )
 
 
+def _resolve_path_dependency_mode(params: Params) -> str:
+    if params.path_dependency_mode:
+        mode = params.path_dependency_mode
+    else:
+        mode = "optimistic" if params.optimistic_fill else "conservative"
+    mode = mode.lower()
+    if mode not in {"optimistic", "conservative", "trend"}:
+        raise SystemExit(f"Unsupported path_dependency_mode: {mode}")
+    return mode
+
+
+def run_opening_proxy_backtest(
+    df: pd.DataFrame, direction: pd.Series, params: Params
+) -> pd.DataFrame:
+    d = df.join(direction.rename("direction"), how="inner").copy()
+    d = d.dropna(subset=["direction", "open", "high", "low", "close"])
+
+    prev_close = d["close"].shift(1)
+    d["pnl_overnight"] = d["direction"] * ((d["open"] / prev_close) - 1.0)
+
+    open_to_high = (d["high"] - d["open"]) / d["open"]
+    open_to_low = (d["low"] - d["open"]) / d["open"]
+    open_to_close = (d["close"] - d["open"]) / d["open"]
+
+    long_tp_hit = open_to_high >= params.take_profit_opening
+    long_sl_hit = open_to_low <= -params.stop_opening
+    short_tp_hit = open_to_low <= -params.take_profit_opening
+    short_sl_hit = open_to_high >= params.stop_opening
+
+    long_close = open_to_close
+    short_close = -open_to_close
+
+    mode = _resolve_path_dependency_mode(params)
+    if mode == "trend":
+        pnl_opening = np.where(
+            d["direction"] == 1,
+            long_close,
+            np.where(d["direction"] == -1, short_close, 0.0),
+        )
+    elif mode == "optimistic":
+        long_choice = np.select(
+            [long_tp_hit, long_sl_hit],
+            [params.take_profit_opening, -params.stop_opening],
+            default=long_close,
+        )
+        short_choice = np.select(
+            [short_tp_hit, short_sl_hit],
+            [params.take_profit_opening, -params.stop_opening],
+            default=short_close,
+        )
+        pnl_opening = np.where(
+            d["direction"] == 1,
+            long_choice,
+            np.where(d["direction"] == -1, short_choice, 0.0),
+        )
+    else:
+        long_choice = np.select(
+            [long_sl_hit, long_tp_hit],
+            [-params.stop_opening, params.take_profit_opening],
+            default=long_close,
+        )
+        short_choice = np.select(
+            [short_sl_hit, short_tp_hit],
+            [-params.stop_opening, params.take_profit_opening],
+            default=short_close,
+        )
+        pnl_opening = np.where(
+            d["direction"] == 1,
+            long_choice,
+            np.where(d["direction"] == -1, short_choice, 0.0),
+        )
+
+    d["pnl_opening"] = pnl_opening
+    pnl_gross = d["pnl_overnight"] + d["pnl_opening"]
+    trade_allowed = d["direction"] != 0
+    d["pnl_net"] = np.where(trade_allowed, pnl_gross - params.cost, 0.0)
+    d["equity"] = (1.0 + d["pnl_net"].fillna(0)).cumprod()
+    return d[["direction", "pnl_overnight", "pnl_opening", "pnl_net", "equity"]]
+
+
 def run_alpha_factor_testing(
     df: pd.DataFrame, params: Params
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], pd.DataFrame]:
@@ -161,47 +243,12 @@ def run_alpha_factor_testing(
     )
     signal = cond.shift(1).fillna(False)
     direction = signal.astype(int)
+    if params.require_flow_data:
+        flow_cols = {"foreign_net", "inst_net"}
+        if not flow_cols.issubset(df.columns):
+            direction = pd.Series(0, index=df.index, dtype=int)
 
-    pnl_overnight = direction * df_features["gap"]
-
-    tp_hit = df_features["open_to_high"] >= params.take_profit_opening
-    stop_hit = df_features["open_to_low"] <= -params.stop_opening
-    open_to_close = (df["close"] - df["open"]) / df["open"]
-
-    if params.optimistic_fill:
-        pnl_opening = np.where(
-            direction == 1,
-            np.where(
-                tp_hit,
-                params.take_profit_opening,
-                np.where(stop_hit, -params.stop_opening, open_to_close),
-            ),
-            0.0,
-        )
-    else:
-        pnl_opening = np.where(
-            direction == 1,
-            np.where(
-                stop_hit,
-                -params.stop_opening,
-                np.where(tp_hit, params.take_profit_opening, open_to_close),
-            ),
-            0.0,
-        )
-
-    pnl_net = pnl_overnight + pnl_opening - direction * params.cost
-    equity = (1 + pnl_net.fillna(0)).cumprod()
-
-    backtest = pd.DataFrame(
-        {
-            "direction": direction,
-            "pnl_overnight": pnl_overnight,
-            "pnl_opening": pnl_opening,
-            "pnl_net": pnl_net,
-            "equity": equity,
-        },
-        index=df.index,
-    )
+    backtest = run_opening_proxy_backtest(df, direction, params)
 
     heatmaps = {
         "feature_corr": df_features[
